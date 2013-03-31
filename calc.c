@@ -1,153 +1,178 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <asm/uaccess.h>
+#include <linux/version.h>
+#include <linux/types.h>
+#include <linux/kdev_t.h>
+#include <linux/device.h>
+#include <linux/cdev.h>
 #include <linux/init.h>
+#include <linux/slab.h>
+#include <asm/uaccess.h>
+#include "devices.h"
 
-/* Char dev files names. */
-#define CALC_RESULT  "calc_result"
+/* Char devices files names. */
 #define CALC_FIRST   "calc_first"
 #define CALC_SECOND  "calc_second"
-#define	CALC_OPERAND "calc_operator"
+#define	CALC_OPERATOR "calc_operator"
+#define CALC_RESULT  "calc_result"
 
-/* Char dev maximum buffer size. */
+/* Char devices maximum file size. */
 #define FILE_MAX_SIZE 16
 
-/* Char dev files names. */
-static char names[][16] = {PROCFS_FIRST, PROCFS_SECOND,
-		        PROCFS_OPERAND, PROCFS_RESULT};
+/* Char devices files names. */
+static char names[][16] = {
+	CALC_FIRST,
+	CALC_SECOND,
+	CALC_OPERATOR,
+	CALC_RESULT
+};
 
-/* Indices fot the readers and writers. */
-static int indices[4];
+/* Device opened counter. */
+static int device_opened = 0;
 
-/* Files small chars buffers. */
-static char** procfs_buffer;
+/* Devices major numbers */
+static int majors[4];
 
-/* Procfs files entries structures. */
-static struct proc_dir_entry** child_procs;
+/* Char devices files buffers. */
+static char** devices_buffer;
 
-/* Hooks when reading from the module proc file. */
-static int proc_read(char* buffer, char** buffer_location, off_t offset,
-		int buffer_length, int* eof, void* data)
+/* User message. */
+static char* message;
+
+/* Device operations struct. */
+static struct file_operations fops = {
+	.read    = device_read,
+	.write   = device_write,
+	.open    = device_open,
+	.release = device_release
+};
+
+/* Devices numbers. */
+static dev_t numbers[4];
+
+/* Global var for the character device struct */
+static struct cdev* c_dev;
+
+/* Global var for the device class */
+static struct class** classes;
+
+static int device_open(struct inode *inode, struct file *file)
 {
-	int ret, number;
-	long a, b, result = 0;
-	char op, *end;
-
-	number = *((int*) data);
-	printk(KERN_INFO "Reading /proc/%s", names[number - 1]);
-
-	if (offset > 0) {
-		ret = 0;
-	} else {
-		if (number == 4) {
-			a = simple_strtol(procfs_buffer[0], &end, 10);
-			if (a == 0 && (*end == procfs_buffer[0][0])) {
-				return sprintf(buffer, "\n%s\n\n", "First operand is not integer.");
-			}
+	if (device_opened)
+		return -EBUSY;
+		
+	device_opened++;
+	try_module_get(THIS_MODULE);
 	
-			b = simple_strtol(procfs_buffer[1], &end, 10);
-			if (b == 0 && (*end == procfs_buffer[1][0])) {
-				return sprintf(buffer, "\n%s\n\n", "Second operand is not integer.");
-			}
-			op = procfs_buffer[2][0];
-			switch (op) {
-				case '+': result = a + b; break;
-				case '-': result = a - b; break;
-				case '*': result = a * b; break;
-				case '/':
-					if (b == 0) {
-						return sprintf(buffer, "\n%s\n\n",
-							"Division by zero!");
-					}
-					result = a / b;
-					break;
-				default: return sprintf(buffer, "\nUnknown operand: %c\n\n", op);
-			}
-			ret = sprintf(buffer, "\n%ld %c %ld = %ld\n\n", a, op, b, result);
-		} else {
-			ret = sprintf(buffer, "\n%s\n\n", procfs_buffer[number - 1]);
-		}
-	}
-
-	return ret;
+	return 0;
 }
 
-/* Hooks when writing the data into the module proc file. */
-static int proc_write(struct file* file, const char* buffer,
-		unsigned long count, void* data)
+static int device_release(struct inode *inode, struct file *file)
 {
-	int procfs_buffer_size, index;
+	device_opened--;
+	
+	module_put(THIS_MODULE);
+	
+	return 0;
+}
 
-	if (count >= PROCFS_MAX_SIZE) {
-		procfs_buffer_size = PROCFS_MAX_SIZE - 1;
-	} else {
-		procfs_buffer_size = count;
+static ssize_t device_read(	struct file *filp, char *buffer, size_t length, loff_t * offset)
+{
+	char name[32];
+	int passed = 0; 
+	
+	if (!(*message)) {
+		return 0;
 	}
-	index = *((int*) data);
-	if (index != 4) {
-		if (copy_from_user(procfs_buffer[index - 1], buffer, procfs_buffer_size)) {
-			printk(KERN_ERR "Failed to write to /proc/%s\n", names[index - 1]);
-			return -EFAULT;
-		}
-		procfs_buffer[index - 1][procfs_buffer_size - 1] = '\0';
+	
+	strcpy(name, filp->f_dentry->d_name.name);
+	
+	if (strcmp(name, CALC_FIRST) == 0) {
+		sprintf(message, "\n%s\n\n", devices_buffer[0]);
 	}
+	
+	while (length && *message) {
+		put_user(*(message++), buffer++);
+		length--;
+		passed++;
+	}
+	
+	return passed;
+}
 
-	printk(KERN_INFO "Writing to /proc/%s\n", names[index - 1]);
-	return procfs_buffer_size;
+static ssize_t device_write(struct file *filp, const char *buff, size_t len, loff_t * off)
+{
+	return 0;
 }
 
 /* Module init function */
 static int __init calc_init(void)
 {
-	int i;
+	int i = 0;
 	
-	printk(KERN_INFO "Calc module is loaded.\n");
+	printk(KERN_INFO "Calc driver was loaded.\n");
 
-	procfs_buffer = (char**) kmalloc(sizeof(char*) * 4, GFP_KERNEL);
+	classes = (struct class**) kmalloc(sizeof(struct class*) * 4, GFP_KERNEL);
+	c_dev = (struct cdev*) kmalloc(sizeof(struct cdev) * 4, GFP_KERNEL);
+	devices_buffer = (char**) kmalloc(sizeof(char*) * 4, GFP_KERNEL);
+	
 	for (i = 0; i < 4; i++) {
-		procfs_buffer[i] = (char*) kmalloc(sizeof(char) * PROCFS_MAX_SIZE, GFP_KERNEL);
-		procfs_buffer[i][0] = '\0';
+		devices_buffer[i] = (char*) kmalloc(sizeof(char) * FILE_MAX_SIZE, GFP_KERNEL);
+		devices_buffer[i][0] = '\0';
 	}
-	
-	child_procs = (struct proc_dir_entry**) kmalloc(
-		sizeof(struct proc_dir_entry *) * 4, GFP_KERNEL);
-	
+  	
 	for (i = 0; i < 4; i++) {
-		child_procs[i] = create_proc_entry(names[i], 0666, NULL);
-		if (!child_procs[i]) {
-			remove_proc_entry(names[i], NULL);
-			printk(KERN_ERR "Failed to create /proc/%s", names[i]);
-			return -ENOMEM;
+		if (alloc_chrdev_region(&numbers[i], 0, 1, names[i]) < 0) {
+			return -1;
 		}
-		indices[i] = i + 1;
-		child_procs[i]->read_proc  = proc_read;
-		child_procs[i]->write_proc = proc_write;
-		child_procs[i]->data	   = (void*) &indices[i];
+		
+		if ((classes[i] = class_create(THIS_MODULE, names[i])) == NULL) {
+			unregister_chrdev_region(numbers[i], 1);
+			return -1;
+	  	}
+	
+		if (device_create(classes[i], NULL, numbers[i], NULL, names[i]) == NULL) {
+			class_destroy(classes[i]);
+			unregister_chrdev_region(numbers[i], 1);
+			return -1;
+		}
+		
+		cdev_init(&c_dev[i], &fops);
+		
+		if (cdev_add(&c_dev[i], numbers[i], 1) == -1) {
+			device_destroy(classes[i], numbers[i]);
+			class_destroy(classes[i]);
+			unregister_chrdev_region(numbers[i], 1);
+			return -1;
+		}
 	}
 
-	printk(KERN_INFO "Calc procs were created.\n");
+	printk(KERN_INFO "Calc driver devices were created.\n");
 	return 0;
 }
 
 /* Module exit function */
 static void __exit calc_exit(void)
-{	
+{
 	int i;
 
 	for (i = 0; i < 4; i++) {
-		remove_proc_entry(names[i], NULL);
-		kfree(procfs_buffer[i]);
+		cdev_del(&c_dev[i]);
+		device_destroy(classes[i], numbers[i]);
+		class_destroy(classes[i]);
+		unregister_chrdev_region(numbers[i], 1);
+		kfree(devices_buffer[i]);
 	}
+	
+	kfree(devices_buffer);
 
-	kfree(child_procs);
-	kfree(procfs_buffer);
-
-	printk(KERN_INFO "Calc procs were removed.\n");
-	printk(KERN_INFO "Calc module is unloaded.\n");
+	printk(KERN_INFO "Calc driver devices were removed.\n");
+	printk(KERN_INFO "Calc driver was unloaded.\n");
 }
 
-MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Blue Carpet");
+MODULE_DESCRIPTION("Calc Character Driver");
+MODULE_LICENSE("GPL");
 
 module_init(calc_init); /* Register module entry point */
 module_exit(calc_exit); /* Register module cleaning up */
